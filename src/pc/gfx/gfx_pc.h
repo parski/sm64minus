@@ -23,6 +23,8 @@ void gfx_start_frame(void);
 void gfx_run(Gfx *commands);
 void gfx_end_frame(void);
 
+void preload_textures(const char *base, const char *actualname);
+
 #ifdef __cplusplus
 }
 #endif

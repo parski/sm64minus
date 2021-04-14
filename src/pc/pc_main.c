@@ -291,6 +291,9 @@ void main_func(void) {
     sound_init();
 
     thread5_game_loop(NULL);
+
+    preload_textures("gfx", "");
+
 #ifdef TARGET_WEB
     /*for (int i = 0; i < atoi(argv[1]); i++) {
         game_loop_one_iteration();

@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <assert.h>
 
+#include <dirent.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb/stb_image.h>
@@ -188,6 +190,13 @@ static const uint8_t missing_texture[MISSING_W * MISSING_H * 4] = {
     0x00, 0x00, 0x00, 0xFF,  0x00, 0x00, 0x00, 0xFF,  0xFF, 0x00, 0xFF, 0xFF,  0xFF, 0x00, 0xFF, 0xFF,
 };
 
+static inline size_t string_hash(const uint8_t *str) {
+    size_t h = 0;
+    for (const uint8_t *p = str; *p; p++)
+        h = 31 * h + *p;
+    return h;
+}
+
 static void gfx_flush(void) {
     if (buf_vbo_len > 0) {
         int num = buf_vbo_num_tris;
@@ -272,11 +281,14 @@ static struct ColorCombiner *gfx_lookup_or_create_color_combiner(uint32_t cc_id)
 }
 
 static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, const uint8_t *orig_addr, uint32_t fmt, uint32_t siz) {
-    size_t hash = (uintptr_t)orig_addr;
-    hash = (hash >> 5) & 0x3ff;
+    size_t hash = string_hash(orig_addr);
+    #define CMPADDR(x, y) (x && !strcmp((const char *)x, (const char *)y))
+
+    hash = (hash >> HASH_SHIFT) & HASH_MASK;
+
     struct TextureHashmapNode **node = &gfx_texture_cache.hashmap[hash];
-    while (*node != NULL && *node - gfx_texture_cache.pool < (int)gfx_texture_cache.pool_pos) {
-        if ((*node)->texture_addr == orig_addr && (*node)->fmt == fmt && (*node)->siz == siz) {
+    while (*node != NULL && *node - gfx_texture_cache.pool < gfx_texture_cache.pool_pos) {
+        if (CMPADDR((*node)->texture_addr, orig_addr) && (*node)->fmt == fmt && (*node)->siz == siz) {
             gfx_rapi->select_texture(tile, (*node)->texture_id);
             if (gEncoreMode)
                 (*node)->linear_filter = (get_palette() == 12);
@@ -307,6 +319,7 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
     (*node)->siz = siz;
     *n = *node;
     return false;
+    #undef CMPADDR
 }
 
 /*static void import_texture_rgba16(int tile) {
@@ -712,6 +725,93 @@ static void import_texture(int tile) {
     } else {
         abort();
     }*/
+}
+
+static bool texname_to_texformat(const char *name, u8 *fmt, u8 *siz) {
+    static const struct {
+        const char *name;
+        const u8 format;
+        const u8 size;
+    } fmt_table[] = {
+        { "rgba16", G_IM_FMT_RGBA, G_IM_SIZ_16b },
+        { "rgba32", G_IM_FMT_RGBA, G_IM_SIZ_32b },
+        { "ia1",    G_IM_FMT_IA,   G_IM_SIZ_8b  }, // uhh
+        { "ia4",    G_IM_FMT_IA,   G_IM_SIZ_4b  },
+        { "ia8",    G_IM_FMT_IA,   G_IM_SIZ_8b  },
+        { "ia16",   G_IM_FMT_IA,   G_IM_SIZ_16b },
+        { "i4",     G_IM_FMT_I,    G_IM_SIZ_4b  },
+        { "i8",     G_IM_FMT_I,    G_IM_SIZ_8b  },
+        { "ci8",    G_IM_FMT_I,    G_IM_SIZ_8b  },
+        { "ci16",   G_IM_FMT_I,    G_IM_SIZ_16b },
+    };
+
+    char *fstr = strrchr(name, '.');
+    if (!fstr) return false; // no format string?
+    fstr++;
+
+    for (unsigned i = 0; i < sizeof(fmt_table) / sizeof(fmt_table[0]); ++i) {
+        if (!strcmp(fstr, fmt_table[i].name)) {
+            *fmt = fmt_table[i].format;
+            *siz = fmt_table[i].size;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void preload_texture(const char *base, const char *path, const char *actualname) {
+    char texname[1024];
+    strncpy(texname, path, sizeof(texname));
+    texname[sizeof(texname)-1] = 0;
+    char *dot = strrchr(texname, '.');
+    if (dot) *dot = 0;
+
+    u8 fmt, siz;
+    if (!texname_to_texformat(texname, &fmt, &siz)) {
+        return;
+    }
+
+    char finalname[1024];
+    strncpy(finalname, actualname, sizeof(finalname));
+    finalname[strlen(finalname)-4] = '\0';
+
+    struct TextureHashmapNode *n;
+    if (!gfx_texture_cache_lookup(0, &n, finalname, fmt, siz))
+        import_texture_custom(path);
+}
+
+
+void preload_textures(const char *base, const char *actualname) {
+    char fullpath[1024];
+    char fullname[1024];
+    struct dirent *ent;
+    
+    DIR *dir = opendir(base);
+
+    if (dir) {
+
+        while ((ent = readdir(dir)) != NULL) {
+
+            if (ent->d_name[0] == 0 || ent->d_name[0] == '.') continue;
+            
+            snprintf(fullpath, sizeof(fullpath), "%s/%s", base, ent->d_name);
+            if (!strcmp(actualname, ""))
+                strncpy(fullname, ent->d_name, sizeof(fullname));
+            else
+                snprintf(fullname, sizeof(fullname), "%s/%s", actualname, ent->d_name);
+
+            struct stat st;
+            if (stat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)) {
+                preload_textures(fullpath, fullname);
+            }
+            else {
+                preload_texture(base, fullpath, fullname);
+            }
+        }
+
+        closedir(dir);
+    }
 }
 
 static void gfx_normalize_vector(float v[3]) {
